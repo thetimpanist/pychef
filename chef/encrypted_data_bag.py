@@ -1,13 +1,12 @@
 from chef.data_bag import DataBag, DataBagItem
 from chef.exceptions import ChefError, ChefServerNotFoundError
 from chef.utils import json
+from chef.api import ChefAPI
 
 from base64 import b64encode, b64decode
 from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
 from Crypto import Random
-
-pad = lambda s: s + (BS - len(s) % BS) * chr(BS - len(s) % BS) 
 
 class EncryptedDataBag(DataBag):
 
@@ -54,7 +53,7 @@ class EncryptedDataBagItem(DataBagItem):
                 self.raw_data[key]['cipher'] == self._ALGORITHM:
 
                 cipher = self._cipher(self.raw_data[key]['iv'])
-                raw_data[key] =  json.loads(self._strip_wrapper(
+                raw_data[key] = json.loads(self._strip_wrapper(
                     cipher.decrypt(b64decode(
                         self.raw_data[key]['encrypted_data'])
                     ).decode()
@@ -91,19 +90,31 @@ class EncryptedDataBagItem(DataBagItem):
                 encrypted_data[key] = self.raw_data[key]
         return encrypted_data
 
+    @classmethod
+    def create(cls, bag, name, key, api=None, **kwargs):
+        """Create a new data bag item. Pass the initial value for any keys as
+        keyword arguments."""
+        api = api or ChefAPI.get_global()
+        obj = cls(bag, name, key, api, skip_load=True)
+        for key, value in six.iteritems(kwargs):
+            obj[key] = value
+        obj.save()
+        if isinstance(bag, EncryptedDataBag) and name not in bag.names:
+            # Mutate the bag in-place if possible, so it will return the new
+            # item instantly
+            bag.names.append(name)
+        return obj
 
     def save(self, api=None):
         api = api or self.api
         self['id'] = self.name
 
         encrypted_data = self.encrypt_data()
-        print(encrypted_data)
 
         try:
             api.api_request('PUT', self.url, data=encrypted_data)
         except ChefServerNotFoundError as e:
-            pass
-            # api.api_request('POST', self.__class__.url + '/' +str(self._bag), 
-            #     data=encrypted_data
-            # )
+            api.api_request('POST', self.__class__.url + '/' +str(self._bag), 
+                data=encrypted_data
+            )
 
