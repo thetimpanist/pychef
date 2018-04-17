@@ -121,10 +121,10 @@ class Cipher(object):
         self.cipher = self._cipher(self.iv)
 
     def factory(key, field):
-        if field['version'] == 1:
-            return CipherV1(key, field)
-        elif field['version'] == 3 or 'version' not in field:
+        if 'version' not in field or field['version'] == 3:
             return CipherV3(key, field)
+        elif field['version'] == 1:
+            return CipherV1(key, field)
         else:
             raise ValueError("Unknown encryption version.")
 
@@ -133,8 +133,8 @@ class Cipher(object):
         key = SHA256.new(self.key).digest()
         return AES.new(key, self._ALGORITHMS[algorithm], b64decode(iv))
 
-    def gen_iv(self, version, size):
-        return b64encode(Random.new().read(size))
+    def gen_iv(self, size):
+        return b64encode(Random.new().read(size)).decode()
 
     def _pad(self, data):
         raise NotImplementedError("Unknown padding type.")
@@ -162,8 +162,8 @@ class Cipher(object):
 
 class CipherV1(Cipher):
 
-    def gen_iv(self, version, size=AES.block_size):
-        return b64encode(Random.new().read(size))
+    def gen_iv(self, size=AES.block_size):
+        return super(CipherV1, self).gen_iv(size)
 
     def _pad(self, data):
         if type(data) is bytes:
@@ -184,8 +184,8 @@ class CipherV1(Cipher):
 
 class CipherV3(Cipher):
 
-    def _gen_iv(self, version, size=12):
-        return super(CipherV3, self).gen_iv(version, size)
+    def gen_iv(self, size=12):
+        return super(CipherV3, self).gen_iv(size)
 
     def _pad(self, data):
         return data # gcm requires no padding
