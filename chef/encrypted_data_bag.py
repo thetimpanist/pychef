@@ -23,8 +23,7 @@ class EncryptedDataBagItem(DataBagItem):
         algorithms.
 
     """
-    _VERSION = 1
-    _ALGORITHM = "aes-256-cbc"
+    _VERSIONS = (1,3,)
 
     def __init__(self, bag, name, key, api=None, skip_load=False):
         super(EncryptedDataBagItem, self).__init__(
@@ -32,38 +31,22 @@ class EncryptedDataBagItem(DataBagItem):
         )
         self._key = key
 
-    def _cipher(self, iv, mode=AES.MODE_CBC): 
-        key = SHA256.new(self._key).digest()
-        return AES.new(key, mode, b64decode(iv))
-
-    def _gen_iv(self):
-        return b64encode(Random.new().read(AES.block_size))
-
-    def _pad(self, data):
-        pad_length = AES.block_size - len(data) % AES.block_size
-        return data + chr(pad_length) * pad_length
-
     def _populate(self, data):
         super(EncryptedDataBagItem, self)._populate(data)
 
         raw_data = {}
         for key in self.raw_data:
-            if 'encrypted_data' in self.raw_data[key] and \
-                self.raw_data[key]['version'] == self._VERSION and \
-                self.raw_data[key]['cipher'] == self._ALGORITHM:
-
-                cipher = self._cipher(self.raw_data[key]['iv'])
-                raw_data[key] = json.loads(self._strip_wrapper(
-                    cipher.decrypt(b64decode(
-                        self.raw_data[key]['encrypted_data'])
-                    ).decode()
-                ))
+            if 'encrypted_data' in self.raw_data[key]:
+                cipher = Cipher.factory(self._key, self.raw_data[key])
+                decrypted_data = cipher.decrypt()
+                raw_data[key] = json.loads(self._strip_wrapper(decrypted_data))
             else:
                 raw_data[key] = self.raw_data[key]
+
+        self._encrypted_data = self.raw_data # save an actual raw copy
         self.raw_data = raw_data
 
     def _strip_wrapper(self, data):
-        # print(data)
         if data.startswith('{"json_wrapper"'):
             return data[data[1:].find('{')+1:data.rfind('}')]
         return data
@@ -76,16 +59,20 @@ class EncryptedDataBagItem(DataBagItem):
         encrypted_data = {}
         for key in self.raw_data:
             if key != "id": # check not alrady encrypted
-                iv = self._gen_iv()
-                cipher = self._cipher(iv)
+
+                data = self._encrypted_data[key] \
+                    if key in self._encrypted_data else {}
+                cipher = Cipher.factory(self._key, data)
                 encrypted_data[key] = {
-                    "encrypted_data": b64encode(cipher.encrypt(
-                        self._pad(self._wrap(self.raw_data[key]))
-                    )).decode(),
-                    "iv": iv.decode(),
-                    "version": self._VERSION,
-                    "cipher": self._ALGORITHM
+                    "encrypted_data": cipher.encrypt(
+                        self._wrap(self.raw_data[key])
+                    ),
+                    "iv": cipher.iv,
+                    "version": cipher.version(),
+                    "cipher": cipher.algorithm()
                 }
+                if cipher.include_auth():
+                    encrypted_data[key]['auth_tag'] = cipher.auth_tag() 
             else:
                 encrypted_data[key] = self.raw_data[key]
         return encrypted_data
@@ -117,4 +104,107 @@ class EncryptedDataBagItem(DataBagItem):
             api.api_request('POST', self.__class__.url + '/' +str(self._bag), 
                 data=encrypted_data
             )
+
+class Cipher(object):
+    """Cipher object for encrypted data bag items."""
+
+    _ALGORITHMS = {
+        "aes-256-cbc": AES.MODE_CBC,
+        "aes-256-gcm": AES.MODE_GCM
+        }
+
+    def __init__(self, key, field):
+        self.assert_correct_version(field)
+        self.key = key
+        self.iv = self.gen_iv() if 'iv' not in field else field['iv']
+        self.field = field
+        self.cipher = self._cipher(self.iv)
+
+    def factory(key, field):
+        if field['version'] == 1:
+            return CipherV1(key, field)
+        elif field['version'] == 3 or 'version' not in field:
+            return CipherV3(key, field)
+        else:
+            raise ValueError("Unknown encryption version.")
+
+    def _cipher(self, iv, algorithm=None):
+        algorithm = algorithm or self.algorithm()
+        key = SHA256.new(self.key).digest()
+        return AES.new(key, self._ALGORITHMS[algorithm], b64decode(iv))
+
+    def gen_iv(self, version, size):
+        return b64encode(Random.new().read(size))
+
+    def _pad(self, data):
+        raise NotImplementedError("Unknown padding type.")
+
+    def version(self):
+        raise NotImplementedError("Invalid Cipher Version.")
+
+    def algorithm(self):
+        raise NotImplementedError("Invalid Cipher Algorithm.")
+
+    def assert_correct_version(self, field):
+        assert 'version' not in field or field['version'] == self.version()
+        assert 'cipher' not in field or field['cipher'] == self.algorithm()
+
+    def decrypt(self):
+        raise NotImplementedError("Abstract Cipher Class.")
+
+    def encrypt(self, data):
+        if type(data) is not bytes:
+            data = data.encode()
+        return b64encode(self.cipher.encrypt(self._pad(data))).decode()
+
+    def include_auth(self):
+        return False
+
+class CipherV1(Cipher):
+
+    def gen_iv(self, version, size=AES.block_size):
+        return b64encode(Random.new().read(size))
+
+    def _pad(self, data):
+        if type(data) is bytes:
+            data = data.decode()
+        pad_length = AES.block_size - len(data) % AES.block_size
+        return (data + chr(pad_length) * pad_length).encode()
+
+    def algorithm(self):
+        return 'aes-256-cbc'
+
+    def version(self):
+        return 1
+
+    def decrypt(self):
+        return self.cipher.decrypt(
+            b64decode(self.field['encrypted_data'])
+        ).decode()
+
+class CipherV3(Cipher):
+
+    def _gen_iv(self, version, size=12):
+        return super(CipherV3, self).gen_iv(version, size)
+
+    def _pad(self, data):
+        return data # gcm requires no padding
+
+    def algorithm(self):
+        return 'aes-256-gcm'
+
+    def version(self):
+        return 3
+
+    def include_auth(self):
+        return True
+
+    def decrypt(self):
+        return self.cipher.decrypt_and_verify(
+            b64decode(self.field['encrypted_data']), 
+            b64decode(self.field['auth_tag'])
+        ).decode()
+
+    def auth_tag(self):
+        return b64encode(self.cipher.digest()).decode()
 
